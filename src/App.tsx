@@ -41,17 +41,17 @@ console.log("PDF Worker", pdfjsLib.GlobalWorkerOptions.workerSrc);
 interface AnalysisResult {
   score: number;
   summary: string;
-  categories: {
+  categories?: {
     skills: { score: number; confidence: string; reason: string };
     experience: { score: number; confidence: string; reason: string };
     education: { score: number; confidence: string; reason: string };
     culturalFit: { score: number; confidence: string; reason: string };
   };
-  matchingDetails: {
+  matchingDetails?: {
     strengths: string[];
     weaknesses: string[];
   };
-  optimizationSuggestions: {
+  optimizationSuggestions?: {
     step: number;
     title: string;
     priority: 'high' | 'medium' | 'low';
@@ -59,7 +59,7 @@ interface AnalysisResult {
     example: string;
     reason: string;
   }[];
-  missingKeywords: string[];
+  missingKeywords?: string[];
 }
 
 interface ErrorBoundaryProps {
@@ -129,6 +129,7 @@ function AppContent() {
   const [fileName, setFileName] = useState<string>("");
   const [jdText, setJdText] = useState<string>("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isAnalyzingDetailed, setIsAnalyzingDetailed] = useState(false);
   const [analysisStep, setAnalysisStep] = useState(0);
   const [isParsing, setIsParsing] = useState(false);
   const [result, setResult] = useState<AnalysisResult | null>(null);
@@ -237,54 +238,78 @@ function AppContent() {
     }
 
     setIsAnalyzing(true);
+    setIsAnalyzingDetailed(false);
     setError(null);
     setResult(null);
-    setOptimizedResume(""); // Reset previous optimized resume on new analysis
+    setOptimizedResume("");
 
     abortControllerRef.current = new AbortController();
 
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-      const model = "gemini-3.1-pro-preview";
+      const model = "gemini-3-flash-preview"; // Use flash for speed in phase 1
 
-      const safeResume = resumeText.slice(0, 3000);
-      const safeJD = jdText.slice(0, 2000);
+      const safeResume = resumeText.slice(0, 2000);
+      const safeJD = jdText.slice(0, 1500);
 
-      const prompt = `
-        作为资深 HR 和职业规划导师，请深度分析以下简历与职位描述 (JD) 的匹配度。
-        
+      // Phase 1: Fast Analysis
+      const fastPrompt = `
+        作为资深 HR，请快速评估以下简历与职位描述 (JD) 的匹配度。
         简历内容: ${safeResume}
         职位描述: ${safeJD}
-        
-        请按照以下要求进行评分和建议：
-        1. 评分维度：
-           - skills (技能匹配): 核心技术栈与工具的重合度。
-           - experience (经验匹配): 行业背景、项目深度与年限。
-           - education (教育背景): 学历、专业与 JD 要求的对齐度。
-           - culturalFit (文化契合): 价值观、软技能与团队氛围。
-        
-        2. 信息充分性判断：
-           - 对每个维度，如果简历中信息不充分，请将 confidence 设为 'low'，score 设为 0-30。
-           - 如果信息中等，confidence 为 'medium'。
-           - 如果信息充分，confidence 为 'high'。
-        
-        3. 优化路线图 (optimizationSuggestions)：
-           - 提供 3-5 个具体的、可执行的步骤。
-           - 每个步骤包含 step (1, 2, 3...), title (模块名), priority (high/medium/low), suggestion (具体建议), example (优化后的示例), reason (优化理由)。
-        
-        请严格返回 JSON 格式。
+        请仅返回 JSON 格式，包含：
+        - score: 0-100 的匹配得分
+        - summary: 一句话的核心总结
       `;
 
-      const response = await ai.models.generateContent({
+      const fastResponse = await ai.models.generateContent({
         model,
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ parts: [{ text: fastPrompt }] }],
         config: {
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
             properties: {
               score: { type: Type.NUMBER },
-              summary: { type: Type.STRING },
+              summary: { type: Type.STRING }
+            },
+            required: ["score", "summary"]
+          },
+          abortSignal: abortControllerRef.current?.signal,
+        }
+      });
+
+      if (abortControllerRef.current?.signal.aborted) return;
+      
+      const fastResult = JSON.parse(fastResponse.text);
+      setResult(fastResult);
+      setIsAnalyzing(false); // Phase 1 complete
+      setIsAnalyzingDetailed(true); // Start Phase 2
+
+      // Phase 2: Detailed Analysis
+      const detailedModel = "gemini-3.1-pro-preview";
+      const detailedPrompt = `
+        基于之前的快速评估（得分: ${fastResult.score}, 总结: ${fastResult.summary}），请对以下简历和 JD 进行深度分析。
+        简历内容: ${safeResume}
+        职位描述: ${safeJD}
+        
+        请提供以下详细信息：
+        1. 评分维度 (categories): skills, experience, education, culturalFit。每个维度包含 score, confidence (high/medium/low), reason。
+        2. 匹配详情 (matchingDetails): strengths (优势), weaknesses (不足)。
+        3. 优化路线图 (optimizationSuggestions): 3-5 个具体步骤，包含 step, title, priority, suggestion, example, reason。
+        4. 缺失关键词 (missingKeywords): 简历中缺失的关键技能或工具。
+        
+        请严格返回 JSON 格式。
+      `;
+
+      const detailedResponse = await ai.models.generateContent({
+        model: detailedModel,
+        contents: [{ parts: [{ text: detailedPrompt }] }],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
               categories: {
                 type: Type.OBJECT,
                 properties: {
@@ -352,7 +377,7 @@ function AppContent() {
               },
               missingKeywords: { type: Type.ARRAY, items: { type: Type.STRING } }
             },
-            required: ["score", "summary", "categories", "matchingDetails", "optimizationSuggestions", "missingKeywords"]
+            required: ["categories", "matchingDetails", "optimizationSuggestions", "missingKeywords"]
           },
           abortSignal: abortControllerRef.current?.signal,
         }
@@ -360,8 +385,11 @@ function AppContent() {
 
       if (abortControllerRef.current?.signal.aborted) return;
       
-      const parsedResult = JSON.parse(response.text);
-      setResult(parsedResult);
+      const detailedResult = JSON.parse(detailedResponse.text);
+      setResult(prev => ({
+        ...prev!,
+        ...detailedResult
+      }));
     } catch (err: any) {
       if (err.name === 'AbortError' || abortControllerRef.current?.signal.aborted) return;
       console.error("Analysis error:", err);
@@ -369,6 +397,7 @@ function AppContent() {
     } finally {
       if (!abortControllerRef.current?.signal.aborted) {
         setIsAnalyzing(false);
+        setIsAnalyzingDetailed(false);
         abortControllerRef.current = null;
       }
     }
@@ -432,7 +461,7 @@ function AppContent() {
     }
   };
 
-  const radarData = result ? [
+  const radarData = result?.categories ? [
     { subject: '技能匹配', A: result.categories.skills.score, fullMark: 100 },
     { subject: '经验匹配', A: result.categories.experience.score, fullMark: 100 },
     { subject: '教育背景', A: result.categories.education.score, fullMark: 100 },
@@ -652,21 +681,17 @@ function AppContent() {
                   <BrainCircuit className="absolute inset-0 m-auto w-12 h-12 text-blue-500 animate-pulse" />
                 </div>
                 <div className="space-y-4">
-                  <h3 className="text-4xl font-display font-bold tracking-tight">正在深度解析</h3>
-                  <p className="text-slate-400 text-lg font-light">AI 正在对比您的简历与岗位要求的核心匹配度...</p>
+                  <h3 className="text-4xl font-display font-bold tracking-tight">正在快速评估</h3>
+                  <p className="text-slate-400 text-lg font-light">AI 正在初步对比您的简历与岗位要求的核心匹配度...</p>
                 </div>
                 <div className="flex justify-center gap-8">
                   <div className="flex flex-col items-center gap-2">
                     <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.3s]" />
-                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Skills</span>
+                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Score</span>
                   </div>
                   <div className="flex flex-col items-center gap-2">
                     <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.15s]" />
-                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Exp</span>
-                  </div>
-                  <div className="flex flex-col items-center gap-2">
-                    <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" />
-                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Fit</span>
+                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Summary</span>
                   </div>
                 </div>
                 <button 
@@ -703,20 +728,27 @@ function AppContent() {
                   </div>
                   
                   <div className="h-[400px] w-full relative">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <RadarChart cx="50%" cy="50%" outerRadius="80%" data={radarData}>
-                        <PolarGrid stroke="#1e293b" strokeDasharray="3 3" />
-                        <PolarAngleAxis dataKey="subject" tick={{ fill: '#64748b', fontSize: 10, fontWeight: 800, letterSpacing: '0.1em' }} />
-                        <Radar
-                          name="匹配度"
-                          dataKey="A"
-                          stroke="#3b82f6"
-                          strokeWidth={3}
-                          fill="#3b82f6"
-                          fillOpacity={0.2}
-                        />
-                      </RadarChart>
-                    </ResponsiveContainer>
+                    {isAnalyzingDetailed && !result.categories ? (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-[#0a1227]/20 backdrop-blur-sm rounded-3xl">
+                        <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
+                        <p className="text-xs font-black text-slate-500 uppercase tracking-widest">Analyzing Dimensions...</p>
+                      </div>
+                    ) : (
+                      <ResponsiveContainer width="100%" height="100%">
+                        <RadarChart cx="50%" cy="50%" outerRadius="80%" data={radarData}>
+                          <PolarGrid stroke="#1e293b" strokeDasharray="3 3" />
+                          <PolarAngleAxis dataKey="subject" tick={{ fill: '#64748b', fontSize: 10, fontWeight: 800, letterSpacing: '0.1em' }} />
+                          <Radar
+                            name="匹配度"
+                            dataKey="A"
+                            stroke="#3b82f6"
+                            strokeWidth={3}
+                            fill="#3b82f6"
+                            fillOpacity={0.2}
+                          />
+                        </RadarChart>
+                      </ResponsiveContainer>
+                    )}
                   </div>
                 </div>
 
@@ -750,15 +782,28 @@ function AppContent() {
                       {!optimizedResume && !isGeneratingResume && (
                         <button 
                           onClick={generateOptimizedResume}
-                          className="px-8 py-3 bg-white text-slate-900 text-[10px] font-black uppercase tracking-widest rounded-full hover:bg-blue-50 transition-all shadow-xl shadow-white/5 active:scale-95"
+                          disabled={isAnalyzingDetailed || !result.optimizationSuggestions}
+                          className={cn(
+                            "px-8 py-3 bg-white text-slate-900 text-[10px] font-black uppercase tracking-widest rounded-full hover:bg-blue-50 transition-all shadow-xl shadow-white/5 active:scale-95",
+                            (isAnalyzingDetailed || !result.optimizationSuggestions) && "opacity-50 cursor-not-allowed grayscale"
+                          )}
                         >
-                          一键生成优化简历
+                          {isAnalyzingDetailed ? "正在准备优化建议..." : "一键生成优化简历"}
                         </button>
                       )}
                     </div>
 
                     <div className="grid grid-cols-1 gap-6">
-                      {result.optimizationSuggestions.map((suggestion, index) => (
+                      {isAnalyzingDetailed && !result.optimizationSuggestions ? (
+                        <div className="py-20 flex flex-col items-center justify-center gap-6 bg-[#0a1227]/30 rounded-[32px] border border-dashed border-slate-800">
+                          <div className="flex gap-2">
+                            <div className="w-2 h-2 bg-yellow-500 rounded-full animate-bounce [animation-delay:-0.3s]" />
+                            <div className="w-2 h-2 bg-yellow-500 rounded-full animate-bounce [animation-delay:-0.15s]" />
+                            <div className="w-2 h-2 bg-yellow-500 rounded-full animate-bounce" />
+                          </div>
+                          <p className="text-sm font-display font-bold text-slate-400">正在生成深度优化建议...</p>
+                        </div>
+                      ) : result.optimizationSuggestions?.map((suggestion, index) => (
                         <div key={index} className="bg-[#0a1227]/50 rounded-[32px] p-10 border border-slate-800/50 group hover:border-blue-500/30 transition-all relative overflow-hidden">
                           <div className="absolute top-0 left-0 w-1 h-full bg-blue-500/20 group-hover:bg-blue-500 transition-all" />
                           <div className="flex items-start gap-8">
